@@ -59,67 +59,62 @@ $$
 
 This emphasizes mismatches at high semantic levels (e.g., sector) more strongly than mismatches at detailed levels.
 
-## D2 — Produced Products (HS Code Set Distance)
+## D2 — Produced Products & D3 — Material / Application Codes  
+### (Unified Feature Structure and Distance)
 
-### Feature Structure
-Each entity is represented by a *set* of HS product codes. Since multiple codes can apply, similarity must be measured through set overlap.
+Both **HS product codes (D2)** and **DIN/ISO material & application codes (D3)** share the *same underlying data structure*  
+and use the *same distance metric*. Each code appears **at most once per entity**, so both are represented as **binary multi-label sets**.
 
-### Metric: Weighted Dice Distance
-Dice distance measures set overlap relative to average set size. A weighted version incorporates informativeness via IDF weighting [1]. Let \(A_i\) and \(A_j\) be the HS code sets of entities \(i\) and \(j\).
-
-**Unweighted Dice:**
-
-$$
-D_D(i,j)
-= 1 - \frac{2\lvert A_i \cap A_j \rvert}
-              {\lvert A_i \rvert + \lvert A_j \rvert} $$ 
-
-
-**IDF weight for code \(k\):**
+### Combined Feature Structure
+For any entity \(i\):
 
 $$
-w_k = \log\left(\frac{N}{f(k)}\right)
+A_i \subseteq \mathcal{C}
 $$
 
-where \(N\) is the total number of entities and \(f(k)\) is the document frequency of code \(k\).
+where $$C$$ is the universe of HS or DIN/ISO codes.
 
-**Weighted Dice:**
+Properties:
+- unordered categorical elements  
+- binary presence (0/1)  
+- multi-label structure  
+- suitable for set-overlap-based similarity  
+- rare codes carry more information  
 
-$$ D_{D,w}(i,j) = 1 - \frac{2 \sum_{k \in A_i \cap A_j} w_k} {\sum_{k \in A_i} w_k + \sum_{k \in A_j} w_k}$$
+### IDF Weighting
 
-
-This downweights frequent HS codes and highlights rare, more informative codes.
-
-## D3 — Material / Application (DIN/ISO Code Sets)
-
-### Feature Structure
-Entities may list multiple DIN/ISO material or application codes. These behave as unordered categorical tokens; therefore set-based comparison is required.
-
-### Metric: Weighted Dice Distance
-Same principle as HS codes: measure overlap, adjust for informativeness.
-
-**Unweighted Dice:**
-
-$$
-D_D(i,j)
-= 1 - \frac{2|S_i \cap S_j|}
-              {|S_i| + |S_j|}
-$$
-
-**IDF weight:**
+Each code \(k\) receives an informativeness weight:
 
 $$
 w_k = \log\left(\frac{N}{f(k)}\right)
 $$
 
-**Weighted Dice:**
+- \(N\): total number of entities  
+- \(f(k)\): number of entities containing code \(k\)  
+- rare codes → high weight  
+- frequent codes → low weight  
+
+### Unified Weighted Dice Distance
+
+For two entities \(i\) and \(j\) with code sets \(A_i\) and \(A_j\) [1]:
 
 $$
-D_{D,w}(i,j) = 1 - \frac{2 \sum_k \min(w_{ik}, w_{jk})}     {\sum_k w_{ik} + \sum_k w_{jk}}
+D_{D,w}(i,j)
+= 1 - \frac{2 \sum_{k \in A_i \cap A_j} w_k}
+{\sum_{k \in A_i} w_k + \sum_{k \in A_j} w_k}
 $$
 
-Weighted Dice works well for multi-label technical standards where rare codes carry more discriminative power.
+#### Properties
+- Applies identically to HS and DIN/ISO code sets  
+- Intersection term is sufficient because codes appear only once  
+- Equivalent to the \(\min(w_{ik}, w_{jk})\) formulation under binary sets  
+- Highly discriminative due to IDF weighting  
 
+### Summary
+D2 and D3 use the **same weighted Dice distance**, based on IDF weights and weighted set overlap.  
+This unified formulation is valid because all codes appear **exactly once** per entity.
+
+---
 
 ## D4 — Geographic Distance (Coordinates + Adjacency Adjustment)
 
