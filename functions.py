@@ -2,21 +2,24 @@
 # -*- coding: utf-8 -*-
 """
 Utility functions for:
-- aligning distance/similarity matrices to a DataFrame,
-- visualizing prototype-based models from distance matrices,
+- aligning pairwise dissimilarity/similarity matrices to a DataFrame,
+-  visualizing prototype-based models from dissimilarity matrices,
 - cross-validated grid search and Bayesian optimization for GLVQ-like models.
 
 Public API:
     align_square_matrix_to_df_order
     align_matrices_to_df
-    visualize_from_distance_and_model
+    visualize_from_dissimilarity_and_model
     stratified_kfold_grid_search
     stratified_kfold_bayes_search
 """
-
-from typing import Dict, Tuple, List, Union, Any, Optional, Type
+from __future__ import annotations
+from typing import Any, Dict, Tuple, List, Union, Any, Optional, Type
 from pathlib import Path
 import pickle
+import itertools
+import inspect
+
 
 import numpy as np
 import pandas as pd
@@ -44,7 +47,7 @@ def align_square_matrix_to_df_order(
     return_numpy: bool = False,
 ) -> Union[pd.DataFrame, np.ndarray]:
     """
-    Reorder a square distance/similarity matrix D_df (index=IDs, columns=IDs)
+    Reorder a square pairwise matrix D_df (typically dissimilarity or similarity; index=IDs, columns=IDs)
     to match the order of df[id_col].
 
     All IDs are cast to str to avoid type mismatches (e.g. "1000013" vs 1000013).
@@ -53,7 +56,7 @@ def align_square_matrix_to_df_order(
     Parameters
     ----------
     D_df : pd.DataFrame
-        Square matrix with identical ID sets in index and columns.
+        Square pairwise matrix with identical ID sets in index and columns.
     df : pd.DataFrame
         DataFrame whose column `id_col` defines the desired order.
     id_col : str
@@ -84,7 +87,7 @@ def align_square_matrix_to_df_order(
     # Reindex in df order
     D_sorted = D_df.loc[df_ids, df_ids]
 
-    # Optional symmetry check (typical for distance matrices)
+    # Optional symmetry check (typical for dissimilarity matrices)
     if not np.allclose(D_sorted.values, D_sorted.values.T, equal_nan=True):
         print("Warning: D_sorted is not exactly symmetric.")
 
@@ -106,7 +109,7 @@ def align_matrices_to_df(
     matrices_as_numpy: bool = True,
 ) -> Tuple[Dict[str, Union[np.ndarray, pd.DataFrame]], pd.Series, List]:
     """
-    Align multiple square matrices to the same ID subset & order defined by df[id_col].
+    Align multiple square pairwise matrices to the same ID subset & order defined by df[id_col].
 
     Steps:
       1) Compute the intersection of IDs over all matrix indices and columns.
@@ -210,7 +213,7 @@ def align_matrices_to_df(
 
 
 # =============================================================================
-# Embedding & visualization from distance matrix
+# Embedding & visualization from dissimilarity matrix
 # =============================================================================
 
 
@@ -222,33 +225,34 @@ def _filter_kwargs(cls, kwargs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return {k: v for k, v in kwargs.items() if k in sig}
 
 
-def _validate_distance_matrix(D: np.ndarray) -> np.ndarray:
+def _validate_dissimilarity_matrix(D: np.ndarray) -> np.ndarray:
     """
-    Validate a distance matrix:
+    Validate a dissimilarity matrix (distance-like, but not necessarily metric):
       - must be square,
       - symmetric,
       - non-negative,
       - diagonal set to zero.
+    Note: no assumption of metric properties (triangle inequality etc.).
     """
     D = np.asarray(D, dtype=np.float64)
     if D.ndim != 2 or D.shape[0] != D.shape[1]:
-        raise ValueError("Distance matrix must be square (n x n).")
+        raise ValueError("Dissimilarity matrix must be square (n x n).")
     np.fill_diagonal(D, 0.0)
     if not np.allclose(D, D.T, atol=1e-8, rtol=1e-8):
-        raise ValueError("Distance matrix must be symmetric.")
+        raise ValueError("Dissimilarity matrix must be symmetric.")
     if (D < -1e-12).any():
-        raise ValueError("Distances must be non-negative.")
+        raise ValueError("Dissimilarities must be non-negative.")
     return D
 
 
-def classical_mds_from_distance(D: np.ndarray, n_components: int = 2) -> np.ndarray:
+def classical_mds_from_dissimilarity(D: np.ndarray, n_components: int = 2) -> np.ndarray:
     """
-    Classical MDS (Torgerson) embedding from a distance matrix.
+    Classical MDS (Torgerson) embedding from a dissimilarity matrix.
 
     Parameters
     ----------
     D : np.ndarray
-        Distance matrix (n x n).
+        Dissimilarity matrix (n x n).
     n_components : int, default 2
         Number of output dimensions.
 
@@ -369,7 +373,7 @@ def _draw_panel(
       - data points (class 0 and 1),
       - prototypes,
       - (optional) prototype trajectories, if provided by the model,
-      - a distance-based “margin” contour between prototype sets.
+      - a distance-based (in embedding space) “margin” contour between prototype sets.
     """
     X2 = np.asarray(X2)
     y_np = np.asarray(y_np).ravel()
@@ -467,6 +471,7 @@ def _draw_panel(
             np.linspace(y_min, y_max, ny),
         )
         grid = np.c_[xx.ravel(), yy.ravel()]
+        # Euclidean distances in the 2D embedding space (this is a true metric here)
         DW = cdist(grid, W_actual, metric="euclidean")
         c0 = np.where(yW == uniqW[0])[0]
         c1 = np.where(yW == uniqW[1])[0]
@@ -510,7 +515,7 @@ def _draw_panel(
 
 
 
-def visualize_from_distance_and_model(
+def visualize_from_dissimilarity_and_model(
     model,
     D: Union[np.ndarray, pd.DataFrame],
     y: Union[np.ndarray, pd.Series, List[int]],
@@ -532,7 +537,7 @@ def visualize_from_distance_and_model(
     umap_save_path: Optional[Union[str, Path]] = None,
 ):
     """
-    Compute 2D embeddings (MDS, t-SNE, UMAP) from a distance matrix and
+    Compute 2D embeddings (MDS, t-SNE, UMAP) from a dissimilarity matrix and
     visualize a prototype-based model in all three spaces.
 
     Parameters
@@ -542,7 +547,7 @@ def visualize_from_distance_and_model(
         `_y` (prototype labels 0/1). Optionally `_w_history` or
         `get_vweight_path()` for trajectories.
     D : array-like (n x n) or DataFrame
-        Distance matrix.
+        Dissimilarity matrix (distance-like; not necessarily metric).
     y : array-like of shape (n,)
         Binary labels (0/1).
     tsne_params, umap_params : dict, optional
@@ -565,7 +570,7 @@ def visualize_from_distance_and_model(
     embeddings : dict
         {"MDS": X_mds, "t-SNE": X_tsne, "UMAP": X_umap}
     """
-    D = _validate_distance_matrix(D)
+    D = _validate_dissimilarity_matrix(D)
     y = np.asarray(y).ravel().astype(int)
     n = D.shape[0]
 
@@ -575,7 +580,7 @@ def visualize_from_distance_and_model(
         X_mds = _load_embedding_2d(mds_load_path, expected_n=n)
     if X_mds is None:
         if use_classical_mds:
-            X_mds = classical_mds_from_distance(D, n_components=2)
+            X_mds = classical_mds_from_dissimilarity(D, n_components=2)
         else:
             mds_params = dict(
                 n_components=2,
@@ -600,7 +605,7 @@ def visualize_from_distance_and_model(
         tsp.setdefault("n_iter", 1000)
         tsp.setdefault("early_exaggeration", 12.0)
         tsp.setdefault("init", "random")
-        tsp["metric"] = "precomputed"
+        tsp["metric"] = "precomputed"  # expects a dissimilarity matrix
         tsp.setdefault("square_distances", True)
         tsp.setdefault("verbose", 0)
         tsp.setdefault("n_jobs", -1)
@@ -622,7 +627,7 @@ def visualize_from_distance_and_model(
         ump.setdefault("min_dist", 0.15)
         ump.setdefault("random_state", random_state)
         ump.setdefault("init", "random")
-        ump["metric"] = "precomputed"
+        ump["metric"] = "precomputed"  # expects a dissimilarity matrix
         ump = _filter_kwargs(UMAP, ump)
         X_umap = UMAP(**ump).fit_transform(D)
         if umap_save_path is not None:
@@ -710,18 +715,18 @@ def _confusion_metrics(
     }
 
 
-def _slice_distance_like(
+def _slice_dissimilarity_like(
     D: Union[pd.DataFrame, np.ndarray, List[np.ndarray]],
     tr_idx: np.ndarray,
     va_idx: np.ndarray,
 ):
     """
-    Slice a distance structure into Train-Train and Val-Train parts.
+    Slice a dissimilarity structure into Train-Train and Val-Train parts.
 
     Supported inputs:
-      - single distance matrix as DataFrame (n x n)
-      - single distance matrix as ndarray (n x n)
-      - list/tuple of distance matrices [D1, D2, ...], each (n x n)
+      - single dissimilarity matrix as DataFrame (n x n)
+      - single dissimilarity matrix as ndarray (n x n)
+      - list/tuple of dissimilarity matrices [D1, D2, ...], each (n x n)
       - 3D tensor (n x n x p), treated as channels
 
     Returns
@@ -748,7 +753,7 @@ def _slice_distance_like(
     D_arr = np.asarray(D)
     if D_arr.ndim == 2:
         if D_arr.shape[0] != D_arr.shape[1]:
-            raise ValueError("Distance matrix must be square.")
+            raise ValueError("Dissimilarity matrix must be square.")
         D_tr = D_arr[np.ix_(tr_idx, tr_idx)]
         D_va_tr = D_arr[np.ix_(va_idx, tr_idx)]
         return D_tr, D_va_tr
@@ -806,16 +811,20 @@ def stratified_kfold_full_metrics(
 ) -> Dict[str, Any]:
     """
     Stratified K-fold cross-validation for GLVQ-like models with a pre-computed
-    distance/kernel structure D.
+    dissimilarity/kernel-like structure D.
+
+    Adds per-fold prototype export (for M3GLVQ / GLVQ-like models):
+      - final_prototypes: list[int] / np.ndarray of prototype indices (e.g. clf._w)
+      - prototype_labels: list[int] / np.ndarray of labels per prototype (e.g. clf._y)
 
     Parameters
     ----------
-    D : distance structure
-        See `_slice_distance_like` for supported formats.
+    D : dissimilarity structure
+        See `_slice_dissimilarity_like` for supported formats.
     y : array-like
         Binary labels (0/1).
     model_cls : Type
-        Model class (e.g. MGLVQ, vMGLVQ_V1, vMGLVQ_V2).
+        Model class (e.g. MGLVQ, vMGLVQ_V1, vMGLVQ_V2, M3GLVQ...).
     model_params : dict, optional
         Initialization parameters for model_cls.
     conf_as_percent : bool, default True
@@ -825,7 +834,7 @@ def stratified_kfold_full_metrics(
     -------
     dict
         {
-          "folds": [...],         # per-fold metrics and final v-weights
+          "folds": [...],         # per-fold metrics, final v-weights, prototypes
           "averages": {...},      # averaged metrics over folds
           "n_splits": int,
           "model_cls": model_cls,
@@ -846,7 +855,7 @@ def stratified_kfold_full_metrics(
 
     fold_results = []
     for f, (tr_idx, va_idx) in enumerate(skf.split(np.arange(n), y), start=1):
-        D_tr, D_va_tr = _slice_distance_like(D, tr_idx, va_idx)
+        D_tr, D_va_tr = _slice_dissimilarity_like(D, tr_idx, va_idx)
 
         y_tr = y[tr_idx]
         y_va = y[va_idx]
@@ -868,6 +877,30 @@ def stratified_kfold_full_metrics(
 
         final_vweights = _get_final_vweights_from_model(clf)
 
+        # -------- NEW: export prototypes + their labels (if available) --------
+        final_prototypes = None
+        prototype_labels = None
+
+        if hasattr(clf, "_w") and getattr(clf, "_w") is not None:
+            try:
+                final_prototypes = np.asarray(getattr(clf, "_w"), dtype=int).ravel()
+            except Exception:
+                final_prototypes = None
+
+        if hasattr(clf, "_y") and getattr(clf, "_y") is not None:
+            try:
+                prototype_labels = np.asarray(getattr(clf, "_y"), dtype=int).ravel()
+            except Exception:
+                prototype_labels = None
+
+        # If only one of them exists or lengths mismatch -> discard to avoid corrupt table rows
+        if final_prototypes is None or prototype_labels is None:
+            final_prototypes = None
+            prototype_labels = None
+        elif final_prototypes.shape[0] != prototype_labels.shape[0]:
+            final_prototypes = None
+            prototype_labels = None
+
         res = {
             "fold": f,
             "train_pos_count": tr_pos,
@@ -882,12 +915,20 @@ def stratified_kfold_full_metrics(
         if final_vweights is not None:
             res["final_vweights"] = final_vweights
 
+        # NEW: attach prototypes + labels to fold result
+        if final_prototypes is not None and prototype_labels is not None:
+            res["final_prototypes"] = final_prototypes
+            res["prototype_labels"] = prototype_labels
+
         fold_results.append(res)
 
         if verbose:
             ba = metrics["balanced_accuracy"]
+            proto_info = ""
+            if final_prototypes is not None:
+                proto_info = f" | protos={final_prototypes.size}"
             print(
-                f"[Fold {f}] bal_acc={ba:.4f} | "
+                f"[Fold {f}] bal_acc={ba:.4f}{proto_info} | "
                 f"pos_rate train={tr_pos_rate:.3f}, val={va_pos_rate:.3f}"
             )
 
@@ -907,14 +948,26 @@ def stratified_kfold_full_metrics(
         "val_pos_rate",
     ]
     avg = {k: float(np.mean([fr[k] for fr in fold_results])) for k in keys_to_avg}
-
+    
+    #ALT
+    # return {
+    #     "folds": fold_results,
+    #     "averages": avg,
+    #     "n_splits": n_splits,
+    #     "model_cls": model_cls,
+    #     "model_params": model_params,
+    # }
+    #NEU
+    model_cls_str = f"{model_cls.__module__}.{model_cls.__qualname__}"
     return {
-        "folds": fold_results,
-        "averages": avg,
-        "n_splits": n_splits,
-        "model_cls": model_cls,
-        "model_params": model_params,
-    }
+            "folds": fold_results,
+            "averages": avg,
+            "n_splits": n_splits,
+            "model_cls": model_cls_str,
+            "model_params": model_params,
+        }
+
+
 
 
 def generate_K_combinations(label_to_values: Dict[int, List[int]]) -> List[Dict[int, int]]:
@@ -1050,6 +1103,17 @@ def stratified_kfold_grid_search(
       - `table_path`: pickle of a pandas DataFrame with one row per fold
                       and parameter combination (including final v-weights).
 
+    Table enhancement:
+      - Adds exactly two columns:
+          * prototypes_label_0 : list[int] of prototype indices assigned to label 0
+          * prototypes_label_1 : list[int] of prototype indices assigned to label 1
+
+    IMPORTANT:
+      This function will try to obtain prototypes/labels per fold via (in order):
+        1) fold_metrics["final_prototypes"] and fold_metrics["prototype_labels"]
+        2) fold_metrics["model"]._w and fold_metrics["model"]._y
+      If neither is available, the two columns will be set to None.
+
     Returns
     -------
     dict
@@ -1089,6 +1153,42 @@ def stratified_kfold_grid_search(
     best_result: Optional[Dict[str, Any]] = None
     table_rows: List[Dict[str, Any]] = []
 
+    def _extract_prototypes_and_labels_from_fold(fm: Any):
+        """
+        Returns (protos, labels) as 1D int arrays or (None, None).
+
+        Supports:
+          - fm["final_prototypes"], fm["prototype_labels"]
+          - fm["model"]._w, fm["model"]._y
+        """
+        if not isinstance(fm, dict):
+            return None, None
+
+        # 1) preferred: explicit keys
+        protos = fm.get("final_prototypes", None)
+        labels = fm.get("prototype_labels", None)
+
+        # 2) fallback: stored model object
+        if (protos is None or labels is None) and ("model" in fm):
+            m = fm.get("model", None)
+            if m is not None:
+                if protos is None and hasattr(m, "_w"):
+                    protos = getattr(m, "_w", None)
+                if labels is None and hasattr(m, "_y"):
+                    labels = getattr(m, "_y", None)
+
+        if protos is None or labels is None:
+            return None, None
+
+        p_arr = np.asarray(protos, dtype=int).ravel()
+        l_arr = np.asarray(labels, dtype=int).ravel()
+
+        if p_arr.shape[0] != l_arr.shape[0]:
+            # inconsistent fold payload
+            return None, None
+
+        return p_arr, l_arr
+
     for i, params in enumerate(param_list, start=1):
         params_filtered = _filter_kwargs(model_cls, params)
 
@@ -1108,8 +1208,9 @@ def stratified_kfold_grid_search(
         )
 
         score = cv_res["averages"][scoring]
-
         folds = cv_res.get("folds", None)
+
+        # -------- collect v-weights per fold --------
         final_vweights_per_fold = []
         if folds is not None:
             for fold_metrics in folds:
@@ -1123,12 +1224,24 @@ def stratified_kfold_grid_search(
         else:
             final_vweights_mean = None
 
+        # -------- collect prototypes/labels per fold (optional in result_dict) --------
+        final_prototypes_per_fold = []
+        prototype_labels_per_fold = []
+        if folds is not None:
+            for fold_metrics in folds:
+                p_arr, l_arr = _extract_prototypes_and_labels_from_fold(fold_metrics)
+                if p_arr is not None and l_arr is not None:
+                    final_prototypes_per_fold.append(p_arr)
+                    prototype_labels_per_fold.append(l_arr)
+
         result_entry = {
             "params": params_filtered,
             "cv_result": cv_res,
             "score": score,
             "final_vweights_per_fold": final_vweights_per_fold if final_vweights_per_fold else None,
             "final_vweights_mean": final_vweights_mean,
+            "final_prototypes_per_fold": final_prototypes_per_fold if final_prototypes_per_fold else None,
+            "prototype_labels_per_fold": prototype_labels_per_fold if prototype_labels_per_fold else None,
         }
         all_results.append(result_entry)
 
@@ -1136,13 +1249,23 @@ def stratified_kfold_grid_search(
             best_score = score
             best_result = result_entry
 
-        # build fold rows for table
+        # -------- build fold rows for table --------
         if folds is not None:
             for fold_idx, fold_metrics in enumerate(folds):
+                # normalize fold dict
                 if isinstance(fold_metrics, dict):
                     final_vweights = fold_metrics.get("final_vweights", None)
+
+                    # remove non-metric payload keys from metrics_dict
                     metrics_dict = {
-                        k: v for k, v in fold_metrics.items() if k != "final_vweights"
+                        k: v
+                        for k, v in fold_metrics.items()
+                        if k not in (
+                            "final_vweights",
+                            "final_prototypes",
+                            "prototype_labels",
+                            "model",
+                        )
                     }
                 else:
                     metrics_dict = fold_metrics
@@ -1150,17 +1273,30 @@ def stratified_kfold_grid_search(
 
                 row = {"fold_index": fold_idx}
 
-                for metric_name, value in metrics_dict.items():
-                    row[metric_name] = value
+                # metrics
+                if isinstance(metrics_dict, dict):
+                    for metric_name, value in metrics_dict.items():
+                        row[metric_name] = value
 
-                if scoring in metrics_dict:
-                    row[f"{scoring}_fold"] = metrics_dict[scoring]
+                    if scoring in metrics_dict:
+                        row[f"{scoring}_fold"] = metrics_dict[scoring]
 
+                # v-weights (wide columns)
                 if final_vweights is not None:
                     v_arr = np.asarray(final_vweights, dtype=float).ravel()
                     for j, vj in enumerate(v_arr):
                         row[f"vweight_{j}"] = vj
 
+                # --- prototypes grouped into exactly two columns (label 0/1) ---
+                p_arr, l_arr = _extract_prototypes_and_labels_from_fold(fold_metrics)
+                if p_arr is not None and l_arr is not None:
+                    row["prototypes_label_0"] = p_arr[l_arr == 0].tolist()
+                    row["prototypes_label_1"] = p_arr[l_arr == 1].tolist()
+                else:
+                    row["prototypes_label_0"] = None
+                    row["prototypes_label_1"] = None
+
+                # params
                 for p_name, p_val in params_filtered.items():
                     row[p_name] = p_val
 
@@ -1168,10 +1304,17 @@ def stratified_kfold_grid_search(
         else:
             avg_metrics = cv_res.get("averages", {})
             row = {"fold_index": -1}
-            for metric_name, value in avg_metrics.items():
-                row[metric_name] = value
+
+            if isinstance(avg_metrics, dict):
+                for metric_name, value in avg_metrics.items():
+                    row[metric_name] = value
+
             for p_name, p_val in params_filtered.items():
                 row[p_name] = p_val
+
+            row["prototypes_label_0"] = None
+            row["prototypes_label_1"] = None
+
             table_rows.append(row)
 
     result_dict = {
@@ -1179,7 +1322,7 @@ def stratified_kfold_grid_search(
         "best_result": best_result,
         "best_score": best_score,
         "scoring": scoring,
-        "model_cls": model_cls,
+        "model_cls": f"{model_cls.__module__}.{model_cls.__qualname__}",   #"model_cls": model_cls,
         "n_splits": n_splits,
         "param_grid": param_grid,
     }
@@ -1217,9 +1360,11 @@ def stratified_kfold_grid_search(
     if table_path is not None:
         table_path = Path(table_path)
         table_path.parent.mkdir(parents=True, exist_ok=True)
+
         df = pd.DataFrame(table_rows)
         with table_path.open("wb") as f:
             pickle.dump(df, f)
+
         if verbose:
             print(
                 f"Fold table saved to '{table_path}' "
@@ -1227,6 +1372,7 @@ def stratified_kfold_grid_search(
             )
 
     return result_dict
+
 
 
 def stratified_kfold_bayes_search(
@@ -1247,29 +1393,6 @@ def stratified_kfold_bayes_search(
     pruner: Optional[optuna.pruners.BasePruner] = None,
     table_path: Optional[Union[str, Path]] = None,
 ) -> Dict[str, Any]:
-    """
-    Bayesian optimization (Optuna) over a param_grid search space for a
-    GLVQ-like model using stratified_kfold_full_metrics as objective.
-
-    param_grid may contain 'label_to_K_values' for per-label K candidates.
-
-    For each trial + fold, one row is added to a DataFrame (optional output),
-    including metrics, hyperparameters and final v-weights (if available).
-
-    Returns
-    -------
-    dict
-        {
-          "all_results": [...],
-          "best_result": {...},
-          "best_score": float,
-          "scoring": str,
-          "model_cls": model_cls,
-          "n_splits": int,
-          "param_grid": dict,
-          "study_best_trial_number": int,
-        }
-    """
     y = np.asarray(y).astype(int).ravel()
     if y.size == 0:
         raise ValueError("y must not be empty.")
@@ -1294,8 +1417,11 @@ def stratified_kfold_bayes_search(
         )
 
         score = cv_res["averages"][scoring]
-        trial.set_user_attr("cv_result", cv_res)
+
+        # store only lightweight, pickle-safe payload
         trial.set_user_attr("model_params", model_params)
+        trial.set_user_attr("averages", cv_res["averages"])
+        trial.set_user_attr("folds", cv_res["folds"])  # optional; needed for table_rows / vweights
 
         if verbose:
             print(f"[Trial {trial.number}] {scoring}={score:.4f}")
@@ -1314,8 +1440,8 @@ def stratified_kfold_bayes_search(
 
     study.optimize(objective, n_trials=n_trials)
 
-    all_results = []
-    best_result = None
+    all_results: List[Dict[str, Any]] = []
+    best_result: Optional[Dict[str, Any]] = None
     best_score = -np.inf
     table_rows: List[Dict[str, Any]] = []
 
@@ -1324,12 +1450,14 @@ def stratified_kfold_bayes_search(
             continue
 
         model_params = tr.user_attrs.get("model_params", None)
-        cv_res = tr.user_attrs.get("cv_result", None)
+        avg = tr.user_attrs.get("averages", None)
+        folds = tr.user_attrs.get("folds", None)
         score = tr.value
 
+        # -------- collect v-weights per fold --------
         final_vweights_per_fold = []
-        if cv_res is not None and "folds" in cv_res and cv_res["folds"] is not None:
-            for fold_metrics in cv_res["folds"]:
+        if folds is not None:
+            for fold_metrics in folds:
                 if isinstance(fold_metrics, dict) and "final_vweights" in fold_metrics:
                     v = np.asarray(fold_metrics["final_vweights"], dtype=float)
                     final_vweights_per_fold.append(v)
@@ -1343,8 +1471,9 @@ def stratified_kfold_bayes_search(
         entry = {
             "trial_number": tr.number,
             "params": model_params,
-            "cv_result": cv_res,
+            "averages": avg,
             "score": score,
+            "folds": folds,
             "final_vweights_per_fold": final_vweights_per_fold if final_vweights_per_fold else None,
             "final_vweights_mean": final_vweights_mean,
         }
@@ -1354,28 +1483,23 @@ def stratified_kfold_bayes_search(
             best_score = score
             best_result = entry
 
-        # build rows for DataFrame
-        if cv_res is not None and "folds" in cv_res and cv_res["folds"] is not None:
-            for fold_idx, fold_metrics in enumerate(cv_res["folds"]):
+        # -------- build rows for DataFrame --------
+        if folds is not None:
+            for fold_idx, fold_metrics in enumerate(folds):
                 if isinstance(fold_metrics, dict):
                     final_vweights = fold_metrics.get("final_vweights", None)
-                    metrics_dict = {
-                        k: v for k, v in fold_metrics.items() if k != "final_vweights"
-                    }
+                    metrics_dict = {k: v for k, v in fold_metrics.items() if k != "final_vweights"}
                 else:
                     metrics_dict = fold_metrics
                     final_vweights = None
 
-                row = {
-                    "trial_number": tr.number,
-                    "fold_index": fold_idx,
-                }
+                row = {"trial_number": tr.number, "fold_index": fold_idx}
 
-                for metric_name, value in metrics_dict.items():
-                    row[metric_name] = value
-
-                if scoring in metrics_dict:
-                    row[f"{scoring}_fold"] = metrics_dict[scoring]
+                if isinstance(metrics_dict, dict):
+                    for metric_name, value in metrics_dict.items():
+                        row[metric_name] = value
+                    if scoring in metrics_dict:
+                        row[f"{scoring}_fold"] = metrics_dict[scoring]
 
                 if final_vweights is not None:
                     v_arr = np.asarray(final_vweights, dtype=float).ravel()
@@ -1393,7 +1517,7 @@ def stratified_kfold_bayes_search(
         "best_result": best_result,
         "best_score": best_score,
         "scoring": scoring,
-        "model_cls": model_cls,
+        "model_cls": f"{model_cls.__module__}.{model_cls.__qualname__}",
         "n_splits": n_splits,
         "param_grid": param_grid,
         "study_best_trial_number": study.best_trial.number,
@@ -1404,9 +1528,9 @@ def stratified_kfold_bayes_search(
         print("Best parameter combination (Bayesian Optimization):")
         print(best_result["params"])
         print(f"\nBest {scoring}: {best_score:.4f}")
-        if best_result["cv_result"] is not None:
+        if best_result.get("averages") is not None:
             print("\nMetrics (mean over folds):")
-            for k, v in best_result["cv_result"]["averages"].items():
+            for k, v in best_result["averages"].items():
                 print(f"  {k}: {v:.4f}")
         if best_result.get("final_vweights_mean") is not None:
             print("\nFinal mean v-weights (over folds):")
@@ -1434,9 +1558,403 @@ def stratified_kfold_bayes_search(
         with table_path.open("wb") as f:
             pickle.dump(df, f)
         if verbose:
-            print(
-                f"Trial/fold table saved to '{table_path}' "
-                f"(pandas.DataFrame as pickle)."
-            )
+            print(f"Trial/fold table saved to '{table_path}' (pandas.DataFrame as pickle).")
 
     return result_dict
+
+
+
+def glvq_mu_values_train(model, y_train, eps=1e-5):
+    """
+    Compute the GLVQ mu value for each training sample:
+    mu_i = (d_plus - d_minus) / (d_plus + d_minus)
+    based on the learned prototypes.
+    """
+    # Full pairwise dissimilarity matrix of the training set (m x m)
+    D_all = model.final_matrix_
+    m = D_all.shape[0]
+
+    # Dissimilarities to all prototypes (m x K)
+    proto_indices = model._w          # indices into the training set
+    proto_labels = model._y           # prototype class labels (K,)
+    D_to_proto = D_all[:, proto_indices]  # (m, K)
+
+    dp = np.empty(m)   # d_+
+    dm = np.empty(m)   # d_-
+
+    classes = np.unique(y_train)
+    for c in classes:
+        mask_x = (y_train == c)          # samples of class c
+        mask_pos = (proto_labels == c)   # prototypes of class c
+        mask_neg = ~mask_pos             # prototypes of other classes
+
+        D_c = D_to_proto[mask_x]         # (n_c, K)
+        dp[mask_x] = D_c[:, mask_pos].min(axis=1)
+        dm[mask_x] = D_c[:, mask_neg].min(axis=1)
+
+    mu = (dp - dm) / (dp + dm + eps)
+
+    # Optionally apply the model's phi function:
+    mu_phi = model.phi(mu)
+
+    return mu, mu_phi
+
+
+
+def _moving_average(x, w):
+    if w is None or w <= 1:
+        return x
+    w = int(max(1, w))
+    ker = np.ones(w, dtype=float) / w
+    ma = np.convolve(x, ker, mode='valid')
+    pad = np.full(w-1, np.nan)
+    return np.concatenate([pad, ma])
+
+def plot_training_overview(
+    model,
+    *,
+    select_v=None,
+    normalize_v=False,
+    smooth_v=None,
+    downsample_v=None,
+    figsize=(12,7),
+    show=True,          # show the plot
+    return_fig=False    # return the matplotlib Figure
+):
+    # === Collect data ===
+    V_path = None
+    if hasattr(model, "get_vweight_path") and callable(model.get_vweight_path):
+        try:
+            V_path = model.get_vweight_path()
+        except Exception:
+            V_path = None
+    if V_path is None and hasattr(model, "_v_path"):
+        V_path = getattr(model, "_v_path", None)
+
+    loss = getattr(model, "_loss", None)
+    has_loss = loss is not None and len(np.asarray(loss).ravel()) > 0
+    has_vpath = V_path is not None and np.asarray(V_path).ndim == 2
+
+    # === Figure layout ===
+    if has_vpath and has_loss:
+        fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=figsize, height_ratios=[3, 1])
+        show_weights = True
+        show_loss_ax = True
+    elif has_vpath and not has_loss:
+        fig, ax_top = plt.subplots(1, 1, figsize=(figsize[0], max(3.0, figsize[1]/2)))
+        ax_bot = None
+        show_weights = True
+        show_loss_ax = False
+    elif has_loss and not has_vpath:
+        fig, ax_bot = plt.subplots(1, 1, figsize=(figsize[0], max(3.0, figsize[1]/2)))
+        ax_top = None
+        show_weights = False
+        show_loss_ax = True
+    else:
+        # Neither weights nor loss available
+        fig, ax_empty = plt.subplots(1, 1, figsize=(figsize[0], max(3.0, figsize[1]/2)))
+        ax_empty.text(0.5, 0.5, "No data found (neither weights nor loss)",
+                      ha="center", va="center", fontsize=12)
+        ax_empty.axis("off")
+        plt.tight_layout()
+        if show:
+            plt.show()
+            if return_fig:
+                plt.close(fig)
+        return fig if return_fig else None
+
+    # === Top: distance weights (v-weights) ===
+    if show_weights:
+        V_path = np.asarray(V_path, dtype=float)
+        steps = V_path.shape[0]
+        idx = np.arange(steps)
+
+        # Selection
+        if select_v is not None:
+            V_plot = V_path[:, select_v]
+            if isinstance(select_v, (list, tuple, np.ndarray)):
+                labels_idx = list(select_v)
+            elif isinstance(select_v, slice):
+                labels_idx = list(range(*select_v.indices(V_path.shape[1])))
+            else:
+                labels_idx = [select_v]
+        else:
+            V_plot = V_path
+            labels_idx = list(range(V_path.shape[1]))
+
+        # Downsample
+        if downsample_v and downsample_v > 1:
+            idx = idx[::downsample_v]
+            V_plot = V_plot[::downsample_v, :]
+
+        # Normalization
+        if normalize_v:
+            mn = np.nanmin(V_plot, axis=0)
+            mx = np.nanmax(V_plot, axis=0)
+            span = np.where((mx - mn) == 0, 1.0, (mx - mn))
+            V_plot = (V_plot - mn) / span
+
+        # Smoothing
+        if smooth_v and smooth_v > 1:
+            V_plot = np.column_stack([_moving_average(V_plot[:, j], smooth_v) for j in range(V_plot.shape[1])])
+
+        # Plot
+        for j in range(V_plot.shape[1]):
+            (ax_top if has_loss else ax_top).plot(idx, V_plot[:, j], lw=1.5, label=f"v{labels_idx[j]}")
+        ax = ax_top  # Alias
+        ax.set_title("Evolution of distance weights")
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Weight" + (" (normalized)" if normalize_v else ""))
+        if V_plot.shape[1] <= 12:
+            ax.legend(frameon=False)
+        else:
+            ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0.)
+
+    # === Bottom: loss ===
+    if show_loss_ax:
+        loss = np.asarray(loss, dtype=float).ravel()
+        ax = ax_bot  # Alias
+        ax.plot(np.arange(len(loss)), loss, lw=1.5, marker='o', ms=3, markevery=max(1, len(loss)//50))
+        ax.set_title("Loss evolution during training")
+        ax.set_xlabel("Update index")
+        ax.set_ylabel("GLVQ loss")
+        ax.grid(True, alpha=0.3)
+
+    # === Render / return without double display (e.g., in notebooks) ===
+    plt.tight_layout()
+    if show:
+        plt.show()
+        if return_fig:
+            plt.close(fig)   # prevent double render in notebooks
+
+    return fig if return_fig else None
+
+
+def _expand_param_grid_with_label_to_K_values(
+    param_grid: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """
+    Expands param_grid into a list of concrete parameter dicts.
+
+    Special key:
+    - 'label_to_K_values': dict[label -> list_of_K]
+      generates cartesian product across labels.
+    """
+    grid = dict(param_grid)
+    label_to_K_values = grid.pop("label_to_K_values", None)
+
+    keys = list(grid.keys())
+    values_lists = [grid[k] if isinstance(grid[k], list) else [grid[k]] for k in keys]
+
+    base_combos: List[Dict[str, Any]] = []
+    for vals in itertools.product(*values_lists):
+        base_combos.append({k: v for k, v in zip(keys, vals)})
+
+    if label_to_K_values is None:
+        return base_combos
+
+    labels = sorted(label_to_K_values.keys())
+    per_label_lists = [label_to_K_values[lbl] for lbl in labels]
+
+    full_combos: List[Dict[str, Any]] = []
+    for base in base_combos:
+        for k_vals in itertools.product(*per_label_lists):
+            ltK = {lbl: k for lbl, k in zip(labels, k_vals)}
+            d = dict(base)
+            d["label_to_K_values"] = ltK
+            full_combos.append(d)
+
+    return full_combos
+
+
+def _sanitize_model_params_for_cls(model_cls: Type, model_params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Fix for your error:
+    - If model __init__ needs 'K' but grid provides 'label_to_K_values',
+      map it to 'K' and drop 'label_to_K_values' (unless accepted).
+
+    Also:
+    - If model __init__ does NOT accept **kwargs, remove unknown keys.
+    """
+    mp = dict(model_params)
+
+    sig = inspect.signature(model_cls.__init__)
+    init_params = set(sig.parameters.keys())
+
+    # Core fix: label_to_K_values -> K
+    if "K" in init_params and "K" not in mp and "label_to_K_values" in mp:
+        mp["K"] = mp["label_to_K_values"]
+
+    # Remove label_to_K_values if not accepted
+    if "label_to_K_values" in mp and "label_to_K_values" not in init_params:
+        mp.pop("label_to_K_values", None)
+
+    # Remove unknown keys unless **kwargs exists
+    has_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    if not has_kwargs:
+        mp = {k: v for k, v in mp.items() if k in init_params}
+
+    return mp
+
+
+def stratified_kfold_grid_search_2(
+    D,
+    y,
+    model_cls: Type,
+    param_grid: Dict[str, Any],
+    n_splits: int = 5,
+    shuffle: bool = True,
+    random_state: int = 42,
+    conf_as_percent: bool = True,
+    verbose: bool = True,
+    scoring: str = "balanced_accuracy",
+    save_path: Optional[Union[str, Path]] = None,
+    table_path: Optional[Union[str, Path]] = None,
+) -> Dict[str, Any]:
+    """
+    GridSearch over param_grid (incl. label_to_K_values) using stratified_kfold_full_metrics.
+    Produces same result structure + optional fold table pickles.
+    """
+    y = np.asarray(y).astype(int).ravel()
+    if y.size == 0:
+        raise ValueError("y must not be empty.")
+
+    combos = _expand_param_grid_with_label_to_K_values(param_grid)
+    if len(combos) == 0:
+        raise ValueError("param_grid produced 0 combinations.")
+
+    if verbose:
+        print(f"Starting GridSearch with {len(combos)} combinations ...")
+
+    all_results: List[Dict[str, Any]] = []
+    best_result: Optional[Dict[str, Any]] = None
+    best_score = -np.inf
+    table_rows: List[Dict[str, Any]] = []
+
+    for trial_number, raw_model_params in enumerate(combos):
+        # IMPORTANT: this line fixes your K-missing error
+        model_params = _sanitize_model_params_for_cls(model_cls, raw_model_params)
+
+        cv_res = stratified_kfold_full_metrics(
+            D=D,
+            y=y,
+            model_cls=model_cls,
+            n_splits=n_splits,
+            shuffle=shuffle,
+            random_state=random_state,
+            model_params=model_params,
+            conf_as_percent=conf_as_percent,
+            verbose=False,
+        )
+
+        score = cv_res["averages"][scoring]
+
+        if verbose:
+            print(f"[Trial {trial_number}] {scoring}={score:.4f}")
+
+        # vweights per fold
+        final_vweights_per_fold = []
+        if cv_res is not None and cv_res.get("folds") is not None:
+            for fold_metrics in cv_res["folds"]:
+                if isinstance(fold_metrics, dict) and "final_vweights" in fold_metrics:
+                    v = np.asarray(fold_metrics["final_vweights"], dtype=float)
+                    final_vweights_per_fold.append(v)
+
+        if final_vweights_per_fold:
+            V_stack = np.stack(final_vweights_per_fold, axis=0)
+            final_vweights_mean = V_stack.mean(axis=0)
+        else:
+            final_vweights_mean = None
+
+        entry = {
+            "trial_number": trial_number,
+            "params": model_params,
+            "cv_result": cv_res,
+            "score": score,
+            "final_vweights_per_fold": final_vweights_per_fold if final_vweights_per_fold else None,
+            "final_vweights_mean": final_vweights_mean,
+        }
+        all_results.append(entry)
+
+        if score > best_score:
+            best_score = score
+            best_result = entry
+
+        # fold table rows
+        if cv_res is not None and cv_res.get("folds") is not None:
+            for fold_idx, fold_metrics in enumerate(cv_res["folds"]):
+                if isinstance(fold_metrics, dict):
+                    final_vweights = fold_metrics.get("final_vweights", None)
+                    metrics_dict = {k: v for k, v in fold_metrics.items() if k != "final_vweights"}
+                else:
+                    metrics_dict = fold_metrics
+                    final_vweights = None
+
+                row = {"trial_number": trial_number, "fold_index": fold_idx}
+
+                if isinstance(metrics_dict, dict):
+                    for metric_name, value in metrics_dict.items():
+                        row[metric_name] = value
+                    if scoring in metrics_dict:
+                        row[f"{scoring}_fold"] = metrics_dict[scoring]
+
+                if final_vweights is not None:
+                    v_arr = np.asarray(final_vweights, dtype=float).ravel()
+                    for j, vj in enumerate(v_arr):
+                        row[f"vweight_{j}"] = vj
+
+                for p_name, p_val in model_params.items():
+                    row[p_name] = p_val
+
+                table_rows.append(row)
+
+    result_dict = {
+        "all_results": all_results,
+        "best_result": best_result,
+        "best_score": best_score,
+        "scoring": scoring,
+        "model_cls": f"{model_cls.__module__}.{model_cls.__qualname__}",    #"model_cls": model_cls,
+        "n_splits": n_splits,
+        "param_grid": param_grid,
+        "best_trial_number": (best_result["trial_number"] if best_result is not None else None),
+    }
+
+    if verbose and best_result is not None:
+        print("\n" + "=" * 80)
+        print("Best parameter combination (GridSearch):")
+        print(best_result["params"])
+        print(f"\nBest {scoring}: {best_score:.4f}")
+        if best_result["cv_result"] is not None:
+            print("\nMetrics (mean over folds):")
+            for k, v in best_result["cv_result"]["averages"].items():
+                print(f"  {k}: {v:.4f}" if isinstance(v, (int, float, np.floating)) else f"  {k}: {v}")
+        if best_result.get("final_vweights_mean") is not None:
+            print("\nFinal mean v-weights (over folds):")
+            print(best_result["final_vweights_mean"])
+        print("=" * 80)
+
+    # Save overall results
+    if save_path is not None:
+        p = Path(save_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("wb") as f:
+            pickle.dump(result_dict, f)
+        if verbose:
+            print(f"GridSearch results saved to '{p}'.")
+
+    # Save trial/fold table
+    if table_path is None and save_path is not None:
+        p = Path(save_path)
+        table_path = p.with_name(p.stem + "_all_trials.pkl")
+
+    if table_path is not None:
+        table_path = Path(table_path)
+        table_path.parent.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame(table_rows)
+        with table_path.open("wb") as f:
+            pickle.dump(df, f)
+        if verbose:
+            print(f"Trial/fold table saved to '{table_path}' (pandas.DataFrame as pickle).")
+
+    return result_dict
+
